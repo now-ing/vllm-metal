@@ -339,7 +339,13 @@ class MetalModelRunner:
 
     Implements the vLLM v1 model runner interface for Apple Silicon.
     Uses true batched decode with BatchKVCache for efficient parallel processing.
+
+    Class-level defaults keep stub-built runners (``__new__`` without
+    ``__init__``, as in tests) functional on the PD-disaggregation guards.
     """
+
+    _kv_connector_worker: Any = None
+    _pd_step_has_meta: bool = False
 
     def __init__(self, vllm_config: VllmConfig):
         """Initialize model runner.
@@ -833,7 +839,8 @@ class MetalModelRunner:
         here we build the worker counterpart and hand it the per-layer
         Metal paged KV pools so it can move blocks in and out.
         """
-        if self.vllm_config.kv_transfer_config is None:
+        # getattr: stub runners in tests build partial vllm_config objects.
+        if getattr(self.vllm_config, "kv_transfer_config", None) is None:
             return
         runtime = self._paged_attention_runtime
         if runtime is None:
