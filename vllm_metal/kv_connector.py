@@ -128,6 +128,13 @@ class MetalFileConnector(KVConnectorBase_V1):
         )
         os.makedirs(self._storage_path, exist_ok=True)
         self._registry: MetalKVBlockRegistry | None = None
+        # Only kv_producer engines write stores: a decode-side engine
+        # computing a prompt locally must never publish its KV back into
+        # the shared directory (one-way transfer plane).
+        self._can_store = self._kv_transfer_config.kv_role in (
+            "kv_producer",
+            "kv_both",
+        )
         logger.info(
             "MetalFileConnector role=%s storage=%s block_size=%d",
             role,
@@ -416,7 +423,9 @@ class MetalFileConnector(KVConnectorBase_V1):
                     )
                 )
                 total_need_load += 1
-            elif not self._found_match_for_prompt(token_ids, mm_hashes):
+            elif self._can_store and not self._found_match_for_prompt(
+                token_ids, mm_hashes
+            ):
                 valid = _align_to_block_size(len(token_ids) - 1, self._block_size)
                 num_blocks = valid // self._block_size
                 if num_blocks == 0:
