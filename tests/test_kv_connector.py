@@ -58,9 +58,7 @@ def _make_registry(seed: float | None = None) -> MetalKVBlockRegistry:
 
 
 def _bind_metadata(connector: MetalFileConnector, requests: list[MetalReqMeta]) -> None:
-    connector.bind_connector_metadata(
-        MetalFileConnectorMetadata(requests=requests)
-    )
+    connector.bind_connector_metadata(MetalFileConnectorMetadata(requests=requests))
 
 
 class TestStoreLoadRoundtrip:
@@ -116,15 +114,13 @@ class TestStoreLoadRoundtrip:
         # Untouched consumer blocks stay zero.
         untouched = set(range(NUM_BLOCKS)) - set(load_blocks)
         for block in untouched:
-            assert (
-                mx.all(consumer_registry.key_caches[0][block] == 0).item() is True
-            )
+            assert mx.all(consumer_registry.key_caches[0][block] == 0).item() is True
 
     def test_load_without_done_marker_raises(self, tmp_path) -> None:
         consumer = _make_connector(tmp_path)
         consumer.set_block_registry(_make_registry())
         # Build a folder with safetensors but no done marker.
-        folder = consumer._folder_for([7, 8, 9], [], create=True)
+        consumer._folder_for([7, 8, 9], [], create=True)
         _bind_metadata(
             consumer,
             [
