@@ -19,6 +19,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _mlx_vlm_garbles_qwen35_mrope() -> bool:
+    """Whether the installed mlx-vlm garbles Qwen3.5/3.6 MLX checkpoints.
+
+    A/B verified in #685: 0.6.4 emits unset-mRoPE token soup, 0.6.8 serves
+    correctly. Returns True (keep the text-backbone override) when mlx-vlm
+    is older than the fixed revision or cannot be imported at all, which
+    keeps the failure mode conservative.
+    """
+    try:
+        from mlx_vlm import __version__ as mlx_vlm_version
+    except Exception:
+        return True
+    try:
+        major, minor, patch = (int(part) for part in mlx_vlm_version.split(".")[:3])
+    except ValueError:
+        return True
+    return (major, minor, patch) < (0, 6, 8)
+
+
 @dataclass(frozen=True, slots=True)
 class TargetModelForwardOutput:
     """Target-model forward output needed by sampling and speculative decode."""
@@ -278,10 +297,18 @@ class DefaultModelAdapter(ModelAdapter):
             return True
 
         # MLX affine Qwen3.5/Qwen3.6 text wrappers may still carry a
-        # vision_config, but mlx_vlm drives those text-only checkpoints with
-        # unset mRoPE state and produces garbled output.  Real Qwen3-VL uses
-        # Qwen3VLForConditionalGeneration, which is not in the text-wrapper
-        # architecture set above and therefore keeps the native path.
+        # vision_config. mlx_vlm <= 0.6.7 drives those text-only checkpoints
+        # with unset mRoPE state and produces garbled output, but 0.6.8 (the
+        # revision these checkpoints were converted with, still inside the
+        # plugin's >=0.6.2,<0.7 pin) serves them correctly on the multimodal
+        # path — verified A/B on Qwen3.5-4B and Qwen3.8-27B (#685). Gate the
+        # override on the installed mlx-vlm so 0.6.8+ keeps native vision
+        # while known-bad versions stay on the text backbone. Real Qwen3-VL
+        # uses Qwen3VLForConditionalGeneration, which is not in the
+        # text-wrapper architecture set above and therefore keeps the
+        # native path.
+        if not _mlx_vlm_garbles_qwen35_mrope():
+            return False
         return self._has_mlx_quantized_weights(hf_config)
 
     def _has_fp8_quantization_config(self, hf_config: Any) -> bool:
