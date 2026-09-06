@@ -6,6 +6,11 @@ error() {
   echo -e "Error: $*" >&2
 }
 
+# Print a warning message
+warning() {
+  echo -e "Warning: $*" >&2
+}
+
 # Print a success message
 success() {
   echo -e "✓ $*"
@@ -127,7 +132,14 @@ ensure_metal_toolchain() {
   fi
 
   echo "Metal toolchain not available, downloading via xcodebuild..."
-  xcodebuild -downloadComponent MetalToolchain
+  # A Command Line Tools-only machine has no xcodebuild at all; treat that as
+  # "toolchain unavailable" rather than letting the non-zero status abort the
+  # caller (install.sh falls back to prebuilt or JIT artifacts).
+  if ! xcodebuild -downloadComponent MetalToolchain; then
+    warning "Could not download the Metal toolchain (xcodebuild failed or unavailable)."
+    rm -rf "${tmpdir}"
+    return 1
+  fi
 
   if ! xcrun -sdk macosx metal -o "${metal_lib}" "${metal_src}" &> /dev/null; then
     error "Metal toolchain still unavailable after download; cannot compile .metallib."
@@ -153,6 +165,107 @@ build_native_artifacts() {
     return 1
   fi
   python -m vllm_metal.metal.build
+}
+
+# Populate vllm_metal/metal/ with the prebuilt native artifacts (the
+# _paged_ops*.so extension and the .metallib shader libraries, including NAX)
+# unpacked from the newest release wheel whose tag matches this checkout's
+# pyproject version. This is the fallback for machines without the Metal
+# toolchain (e.g. Xcode Command Line Tools only), where .metallib files
+# cannot be compiled locally. The runtime loads these artifacts as-is, so
+# an editable Python install plus the unpacked files is fully functional.
+#
+# Must run from the repo root with the venv active (install.sh source-checkout
+# path guarantees both), because the expected file names are resolved from the
+# locally checked-out vllm_metal.metal.build.
+fetch_prebuilt_native_artifacts() {
+  section "Fetching prebuilt native artifacts from release wheel"
+
+  local version
+  if ! version=$(get_version); then
+    error "Failed to read the project version from pyproject.toml."
+    return 1
+  fi
+
+  # Match vX.Y.Z (stable) or vX.Y.Z.devN (dev channel) releases only, so the
+  # artifacts' ABI stays in family with this checkout.
+  local release_data
+  if ! release_data=$(curl -fsSL \
+      "https://api.github.com/repos/vllm-project/vllm-metal/releases?per_page=30"); then
+    warning "Failed to query GitHub releases for prebuilt artifacts."
+    return 1
+  fi
+
+  local wheel_url
+  wheel_url=$(VERSION="${version}" RELEASE_DATA="${release_data}" python3 -c '
+import json
+import os
+import re
+import sys
+
+try:
+    releases = json.loads(os.environ["RELEASE_DATA"])
+except Exception:
+    sys.exit(0)
+
+# /releases is newest-first; take the newest wheel within this version family.
+pattern = re.compile(r"^v" + re.escape(os.environ["VERSION"]) + r"(\.dev[0-9]+)?$")
+for release in releases:
+    if not pattern.match(release.get("tag_name") or ""):
+        continue
+    for asset in release.get("assets", []):
+        if (asset.get("name") or "").endswith(".whl"):
+            print(asset.get("browser_download_url", ""))
+            sys.exit(0)
+')
+
+  if [[ -z "${wheel_url}" ]]; then
+    warning "No release wheel matches version ${version}."
+    return 1
+  fi
+
+  local tmp_dir wheel_path
+  tmp_dir=$(mktemp -d)
+  register_cleanup_dir "${tmp_dir}"
+  wheel_path="${tmp_dir}/$(basename "${wheel_url}")"
+  echo "Downloading ${wheel_path##*/}..."
+  if ! curl -fsSL "${wheel_url}" -o "${wheel_path}"; then
+    warning "Failed to download the release wheel."
+    return 1
+  fi
+
+  # Unpack only the prebuilt artifacts into the source tree; build-time
+  # .sha256 sidecars are not needed because the runtime loader does not
+  # consult them.
+  if ! WHEEL_PATH="${wheel_path}" python -c "
+import os
+import sys
+import zipfile
+
+from vllm_metal.metal.build import (
+    METALLIB_NAMES,
+    NAX_METALLIB_NAME,
+    metallib_path,
+    output_path,
+)
+
+prefix = 'vllm_metal/metal/'
+names = {output_path().name}
+names.update(metallib_path(n).name for n in (*METALLIB_NAMES, NAX_METALLIB_NAME))
+with zipfile.ZipFile(os.environ['WHEEL_PATH']) as zf:
+    members = [m for m in zf.namelist() if m.startswith(prefix) and m[len(prefix):] in names]
+    missing = names - {m[len(prefix):] for m in members}
+    if missing:
+        print('wheel is missing artifacts: ' + ', '.join(sorted(missing)), file=sys.stderr)
+        sys.exit(1)
+    zf.extractall('.', members=members)
+print('unpacked %d artifacts' % len(members))
+"; then
+    warning "The release wheel does not carry the expected native artifacts."
+    return 1
+  fi
+
+  success "Prebuilt native artifacts installed into vllm_metal/metal/"
 }
 
 # Fail unless the freshly built wheel actually bundles the prebuilt native

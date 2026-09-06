@@ -266,8 +266,23 @@ EOF
 
     # Source checkouts build native artifacts; release installs use the wheel.
     uv pip install -e .
-    ensure_metal_toolchain
-    build_native_artifacts
+    if ensure_metal_toolchain; then
+      build_native_artifacts
+    else
+      # No Metal toolchain (e.g. Xcode Command Line Tools only): fall back to
+      # the matching release wheel's prebuilt artifacts, and failing that,
+      # finish the install with a pointer to the JIT runtime path.
+      if fetch_prebuilt_native_artifacts; then
+        echo ""
+        echo "Note: serving will use the prebuilt .metallib files unpacked above."
+        echo "To build them locally instead, install full Xcode and rerun ./install.sh."
+      else
+        warning "Continuing without prebuilt Metal artifacts."
+        echo "To compile them locally, install full Xcode and rerun ./install.sh." >&2
+        echo "Or run inference with VLLM_METAL_BUILD_FROM_SOURCE=1: MLX JIT-compiles" >&2
+        echo "the shaders in-process, and Command Line Tools are sufficient for that." >&2
+      fi
+    fi
   else
     local release_data selected release_tag wheel_url vllm_release_tag
     release_data=$(fetch_release "$repo_owner" "$repo_name" "$channel")
