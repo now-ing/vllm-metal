@@ -176,9 +176,7 @@ class MetalFileConnector(KVConnectorBase_V1):
                 # the payload covers only the block-aligned external prefix
                 # — scatter into the leading blocks.
                 num_blocks = payload["key"].shape[0]
-                block_index = mx.array(
-                    request.block_ids[:num_blocks], dtype=mx.uint32
-                )
+                block_index = mx.array(request.block_ids[:num_blocks], dtype=mx.uint32)
                 key_cache = registry.key_caches[layer_idx]
                 value_cache = registry.value_caches[layer_idx]
                 key_cache[block_index] = payload["key"]
@@ -229,9 +227,7 @@ class MetalFileConnector(KVConnectorBase_V1):
             if not request.block_ids:
                 # Prompt shorter than block_size aligns down to zero
                 # blocks; nothing to transfer for this request.
-                logger.info(
-                    "Skipping KV store for short prompt (0 aligned blocks)"
-                )
+                logger.info("Skipping KV store for short prompt (0 aligned blocks)")
                 continue
             folder = self._folder_for(request.token_ids, request.mm_hashes, create=True)
             block_index = mx.array(request.block_ids, dtype=mx.uint32)
