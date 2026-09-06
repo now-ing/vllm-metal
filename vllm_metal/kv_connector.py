@@ -112,6 +112,11 @@ class MetalFileConnector(KVConnectorBase_V1):
             kv_cache_config=kv_cache_config,
         )
         self._block_size = vllm_config.cache_config.block_size
+        # Same prompt under a different cache_salt (or a LoRA adapter, not
+        # yet folded in) must never hit another engine's store.
+        self._cache_salt: str = (
+            getattr(vllm_config.cache_config, "cache_salt", None) or ""
+        )
         self._requests_need_load: dict[str, Request] = {}
         self._storage_path: str = self._kv_transfer_config.get_from_extra_config(
             "shared_storage_path", "/tmp/vllm-metal-kvshare"
@@ -221,9 +226,18 @@ class MetalFileConnector(KVConnectorBase_V1):
         """Dump store-planned KV blocks to the shared directory.
 
         Called by the model runner after the forward pass is evaluated.
-        Gathers the request's blocks out of every layer pool and writes
-        one safetensors file per layer plus a ``done`` marker, so the
-        consumer's existence check never observes a partial write.
+
+        Ordering guarantee (save-vs-free): the engine core is step
+        synchronous on the Metal path — ``sample_tokens`` (which invokes
+        this bulk save) returns before the scheduler runs its next
+        ``schedule()`` and can free or reallocate any of this step's
+        blocks. The gather below therefore always reads blocks that this
+        step still owns; no delay_free_blocks handshake is required.
+
+        Publication is atomic: files land in a hidden staging directory
+        renamed into place as a whole, so a consumer never observes a
+        partially-written prefix and a crashed store never wedges the
+        prefix key (a re-store simply stages and renames again).
         """
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, MetalFileConnectorMetadata)
@@ -237,22 +251,28 @@ class MetalFileConnector(KVConnectorBase_V1):
                 # blocks; nothing to transfer for this request.
                 logger.info("Skipping KV store for short prompt (0 aligned blocks)")
                 continue
-            folder = self._folder_for(request.token_ids, request.mm_hashes, create=True)
+            folder = self._folder_for(request.token_ids, request.mm_hashes)
+            staging = f"{folder}.staging-{os.getpid()}"
+            shutil.rmtree(staging, ignore_errors=True)
+            os.makedirs(staging, exist_ok=True)
             block_index = mx.array(request.block_ids, dtype=mx.uint32)
             for layer_idx in range(registry.num_layers):
                 key_blocks = registry.key_caches[layer_idx][block_index]
                 value_blocks = registry.value_caches[layer_idx][block_index]
                 mx.eval(key_blocks, value_blocks)
                 mx.save_safetensors(
-                    os.path.join(folder, f"layer_{layer_idx:04d}.safetensors"),
+                    os.path.join(staging, f"layer_{layer_idx:04d}.safetensors"),
                     {"key": key_blocks, "value": value_blocks},
                 )
             # Layout manifest: the consumer refuses to load a prefix whose
             # geometry does not match its own pools (fail-fast instead of
             # silently scattering mismatched blocks into the paged cache).
-            self._write_manifest(folder, registry, len(request.block_ids))
-            with open(os.path.join(folder, _DONE_MARKER), "wb") as marker:
+            self._write_manifest(staging, registry, len(request.block_ids))
+            with open(os.path.join(staging, _DONE_MARKER), "wb") as marker:
                 marker.write(b"ok")
+            shutil.rmtree(folder, ignore_errors=True)
+            os.rename(staging, folder)
+            self._fsync_dir(self._storage_path)
             self._maybe_prune_stores()
             logger.info(
                 "Stored %d KV blocks x %d layers to %s",
@@ -260,6 +280,18 @@ class MetalFileConnector(KVConnectorBase_V1):
                 registry.num_layers,
                 folder,
             )
+
+    @staticmethod
+    def _fsync_dir(path: str) -> None:
+        """Best-effort directory fsync so the rename survives a crash."""
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
 
     def _write_manifest(
         self, folder: str, registry: MetalKVBlockRegistry, num_blocks: int
@@ -322,6 +354,8 @@ class MetalFileConnector(KVConnectorBase_V1):
             return
         entries = []
         for name in os.listdir(self._storage_path):
+            if ".staging-" in name:
+                continue
             done = os.path.join(self._storage_path, name, _DONE_MARKER)
             if os.path.exists(done):
                 entries.append((os.path.getmtime(done), name))
@@ -423,9 +457,21 @@ class MetalFileConnector(KVConnectorBase_V1):
             )
             total_need_load += 1
 
-        assert total_need_load == len(self._requests_need_load)
+        # A request cancelled between update_state_after_alloc and here
+        # would silently drop out of scheduled_new_reqs; drain instead of
+        # asserting so cancellation cannot crash EngineCore.
+        if total_need_load != len(self._requests_need_load):
+            logger.warning(
+                "Dropping %d load-planned request(s) not scheduled this step "
+                "(cancelled or preempted); they will re-plan on retry",
+                len(self._requests_need_load) - total_need_load,
+            )
         self._requests_need_load.clear()
         return meta
+
+    def request_finished(self, request: Request, block_ids: list[list[int]]) -> None:
+        """Drop any pending load plan for a finished/cancelled request."""
+        self._requests_need_load.pop(request.request_id, None)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -459,6 +505,7 @@ class MetalFileConnector(KVConnectorBase_V1):
         hasher = hashlib.sha256(
             b",".join(str(t).encode() for t in token_ids) if token_ids else b""
         )
+        hasher.update(self._cache_salt.encode())
         for mm_hash in mm_hashes:
             hasher.update(mm_hash.encode("utf-8"))
         folder = os.path.join(self._storage_path, hasher.hexdigest())

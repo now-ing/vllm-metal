@@ -91,6 +91,7 @@ The decode instance's work drops **2.7×** (1.60 s → 0.59 s) — that is the d
 - **Synchronous file transfer.** Store/load sit on the forward path. Performance is explicitly not the goal of this bring-up; correctness is.
 - **Demo-grade cross-machine transport.** The validated cross-Mac setup used a two-phase rsync-over-ssh watcher (~72 MB/s observed over Wi-Fi). NFS/sshfs shares work; nothing here is fast yet.
 - **Short prompts don't transfer.** Prefixes shorter than `block_size + 1` tokens are not stored/loaded.
+- **All-or-nothing hits.** The transfer key is the whole block-aligned prompt, so there is no prefix sharing across different-length prompts: a shorter prompt does not hit a longer one's store. Fine for v1; prefix-granular keys are future work. `cache_salt` is folded into the key; LoRA adapters are not yet (same prompt under different adapters must not share stores today — use separate storage paths per adapter).
 - **Chunked prefill.** Only requests scheduled as a single full chunk are stored (PoC limitation).
 - **Single KV cache group only.** Dense MHA/GQA models. Hybrid linear-attention models raise `NotImplementedError`; MLA is not supported.
 - **HMA disabled.** The connector does not declare `SupportsHMA`; PD runs require `--disable-hybrid-kv-cache-manager`.
