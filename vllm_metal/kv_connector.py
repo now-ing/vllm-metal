@@ -27,7 +27,9 @@ worker attach time.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -114,6 +116,11 @@ class MetalFileConnector(KVConnectorBase_V1):
         self._storage_path: str = self._kv_transfer_config.get_from_extra_config(
             "shared_storage_path", "/tmp/vllm-metal-kvshare"
         )
+        # 0 disables cleanup; otherwise oldest stores (by done-marker mtime)
+        # are pruned past this many entries.
+        self._max_stored_prefixes: int = int(
+            self._kv_transfer_config.get_from_extra_config("max_stored_prefixes", 0)
+        )
         os.makedirs(self._storage_path, exist_ok=True)
         self._registry: MetalKVBlockRegistry | None = None
         logger.info(
@@ -168,6 +175,7 @@ class MetalFileConnector(KVConnectorBase_V1):
                     f"KV for request vanished before load: {folder} has no "
                     f"{_DONE_MARKER} marker"
                 )
+            self._validate_manifest(folder, len(request.block_ids))
             for layer_idx in range(registry.num_layers):
                 payload = mx.load(
                     os.path.join(folder, f"layer_{layer_idx:04d}.safetensors")
@@ -239,14 +247,88 @@ class MetalFileConnector(KVConnectorBase_V1):
                     os.path.join(folder, f"layer_{layer_idx:04d}.safetensors"),
                     {"key": key_blocks, "value": value_blocks},
                 )
+            # Layout manifest: the consumer refuses to load a prefix whose
+            # geometry does not match its own pools (fail-fast instead of
+            # silently scattering mismatched blocks into the paged cache).
+            self._write_manifest(folder, registry, len(request.block_ids))
             with open(os.path.join(folder, _DONE_MARKER), "wb") as marker:
                 marker.write(b"ok")
+            self._maybe_prune_stores()
             logger.info(
                 "Stored %d KV blocks x %d layers to %s",
                 len(request.block_ids),
                 registry.num_layers,
                 folder,
             )
+
+    def _write_manifest(
+        self, folder: str, registry: MetalKVBlockRegistry, num_blocks: int
+    ) -> None:
+        first = registry.key_caches[0]
+        _, block_size, kv_heads, head_dim = first.shape
+        manifest = {
+            "version": 1,
+            "num_layers": registry.num_layers,
+            "num_blocks": num_blocks,
+            "block_size": int(block_size),
+            "kv_heads": int(kv_heads),
+            "head_dim": int(head_dim),
+            "dtype": str(first.dtype),
+        }
+        with open(os.path.join(folder, "manifest.json"), "w") as fh:
+            json.dump(manifest, fh)
+
+    def _validate_manifest(self, folder: str, num_blocks_expected: int) -> None:
+        """Refuse loads whose stored geometry disagrees with this engine."""
+        registry = self._require_registry()
+        path = os.path.join(folder, "manifest.json")
+        if not os.path.exists(path):
+            raise ValueError(
+                f"KV store {folder} has no manifest.json; refusing to load "
+                "(store and consumer must run the same connector version)"
+            )
+        with open(path) as fh:
+            manifest = json.load(fh)
+        first = registry.key_caches[0]
+        _, block_size, kv_heads, head_dim = first.shape
+        mismatches = []
+        if manifest["num_layers"] != registry.num_layers:
+            mismatches.append(
+                f"num_layers {manifest['num_layers']} != {registry.num_layers}"
+            )
+        if manifest["block_size"] != int(block_size):
+            mismatches.append(
+                f"block_size {manifest['block_size']} != {int(block_size)}"
+            )
+        if manifest["kv_heads"] != int(kv_heads):
+            mismatches.append(f"kv_heads {manifest['kv_heads']} != {int(kv_heads)}")
+        if manifest["head_dim"] != int(head_dim):
+            mismatches.append(f"head_dim {manifest['head_dim']} != {int(head_dim)}")
+        if manifest["num_blocks"] > num_blocks_expected:
+            mismatches.append(
+                f"store holds {manifest['num_blocks']} blocks but only "
+                f"{num_blocks_expected} were allocated for this request"
+            )
+        if mismatches:
+            raise ValueError(
+                "KV store geometry mismatch for "
+                f"{folder}: {'; '.join(mismatches)}. The producer and "
+                "consumer must serve the same model, revision, and "
+                "cache configuration."
+            )
+
+    def _maybe_prune_stores(self) -> None:
+        if self._max_stored_prefixes <= 0:
+            return
+        entries = []
+        for name in os.listdir(self._storage_path):
+            done = os.path.join(self._storage_path, name, _DONE_MARKER)
+            if os.path.exists(done):
+                entries.append((os.path.getmtime(done), name))
+        entries.sort()
+        excess = len(entries) - self._max_stored_prefixes
+        for _, name in entries[: max(excess, 0)]:
+            shutil.rmtree(os.path.join(self._storage_path, name), ignore_errors=True)
 
     # ------------------------------------------------------------------
     # KVConnectorBase scheduler hooks
@@ -263,7 +345,10 @@ class MetalFileConnector(KVConnectorBase_V1):
         logger.info("External KV cache hit for request %s", request.request_id)
         token_ids = request.prompt_token_ids or []
         num_tokens_to_check = _align_to_block_size(len(token_ids) - 1, self._block_size)
-        return num_tokens_to_check - num_computed_tokens, False
+        # KVConnector contract (RFC #44223): never report fewer tokens than
+        # the engine already computed — a negative count would corrupt the
+        # scheduler's num_computed_tokens accounting.
+        return max(0, num_tokens_to_check - num_computed_tokens), False
 
     def update_state_after_alloc(
         self,

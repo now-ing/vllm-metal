@@ -135,6 +135,94 @@ class TestStoreLoadRoundtrip:
         with pytest.raises(FileNotFoundError):
             consumer.start_load_kv(None)
 
+    def test_geometry_mismatch_refuses_load(self, tmp_path) -> None:
+        producer = _make_connector(tmp_path)
+        producer.set_block_registry(_make_registry(seed=1.0))
+        # Metadata token_ids are the aligned prefix (as build_connector_meta
+        # produces) — both sides must key the identical list.
+        tokens = list(range(12))
+        _bind_metadata(
+            producer,
+            [
+                MetalReqMeta(
+                    token_ids=tokens,
+                    block_ids=[1, 3],
+                    is_store=True,
+                    mm_hashes=[],
+                )
+            ],
+        )
+        producer.save_finished_requests()
+        producer.clear_connector_metadata()
+
+        # Consumer with a different head_dim must refuse the load.
+        def wide_registry() -> MetalKVBlockRegistry:
+            arr = mx.zeros(
+                (NUM_BLOCKS, BLOCK_SIZE, HEADS, HEAD_DIM * 2), dtype=mx.float16
+            )
+            return MetalKVBlockRegistry(
+                key_caches=[arr for _ in range(NUM_LAYERS)],
+                value_caches=[arr for _ in range(NUM_LAYERS)],
+                block_size=BLOCK_SIZE,
+                num_blocks=NUM_BLOCKS,
+            )
+
+        consumer = _make_connector(tmp_path)
+        consumer.set_block_registry(wide_registry())
+        _bind_metadata(
+            consumer,
+            [
+                MetalReqMeta(
+                    token_ids=tokens,
+                    block_ids=[5, 2],
+                    is_store=False,
+                    mm_hashes=[],
+                )
+            ],
+        )
+        with pytest.raises(ValueError, match="geometry mismatch"):
+            consumer.start_load_kv(None)
+
+    def test_store_prunes_oldest_beyond_limit(self, tmp_path) -> None:
+        connector = _make_connector(tmp_path)
+        connector._max_stored_prefixes = 1
+        connector.set_block_registry(_make_registry(seed=1.0))
+        for seed_tokens in ([1, 2, 3, 4], [5, 6, 7, 8]):
+            _bind_metadata(
+                connector,
+                [
+                    MetalReqMeta(
+                        token_ids=seed_tokens,
+                        block_ids=[0, 1],
+                        is_store=True,
+                        mm_hashes=[],
+                    )
+                ],
+            )
+            connector.save_finished_requests()
+            connector.clear_connector_metadata()
+        stored = list(os.listdir(str(tmp_path)))
+        assert len(stored) == 1
+
+    def test_matched_tokens_never_negative(self, tmp_path) -> None:
+        connector = _make_connector(tmp_path, role=KVConnectorRole.SCHEDULER)
+        aligned = _align(20)
+        folder = connector._folder_for(list(range(aligned)), [], create=True)
+        with open(os.path.join(folder, "done"), "wb") as fh:
+            fh.write(b"ok")
+        request = SimpleNamespace(
+            request_id="r0",
+            prompt_token_ids=list(range(20)),
+            mm_features=[],
+        )
+        # Engine already computed more than the aligned prefix holds.
+        matched, _ = connector.get_num_new_matched_tokens(request, aligned + 5)
+        assert matched == 0
+
+
+def _align(n: int) -> int:
+    return (n - 1) // BLOCK_SIZE * BLOCK_SIZE
+
 
 class TestSchedulerRole:
     def test_miss_then_hit_after_store(self, tmp_path) -> None:
