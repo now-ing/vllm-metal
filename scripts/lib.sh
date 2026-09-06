@@ -181,8 +181,11 @@ build_native_artifacts() {
 fetch_prebuilt_native_artifacts() {
   section "Fetching prebuilt native artifacts from release wheel"
 
+  # The venv python is already active here; reading pyproject through it
+  # avoids the noisy `uv run` VIRTUAL_ENV-mismatch warning.
   local version
-  if ! version=$(get_version); then
+  if ! version=$(python -c \
+      "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"); then
     error "Failed to read the project version from pyproject.toml."
     return 1
   fi
