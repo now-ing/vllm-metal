@@ -80,6 +80,12 @@ Token identity is the core of the check: under greedy decoding, any corruption, 
 
 The decode instance's work drops **2.7×** (1.60 s → 0.59 s) — that is the disaggregation effect: the consumer no longer prefills. End-to-end time is currently dominated by the demo rsync transport, not by the connector; the numbers characterize the *file* transfer plane, not the ceiling of PD on Apple Silicon.
 
+## Design notes (anticipated review questions)
+
+- **Why store only the block-aligned prefix (the `len - 1` alignment)?** The consumer must compute at least the final prompt token itself, so the transferable prefix excludes the last (possibly partial) block. This mirrors `ExampleConnector`'s key semantics; the consumer's forward covers the unaligned tail, and greedy output was verified token-identical against monolithic serving.
+- **Why bulk `save_finished_requests` instead of per-layer `save_kv_layer`?** The Metal path has no per-attention-op hookpoint (MLX attention wrappers do not expose the layer boundary the CUDA custom-op path does), so the plugin's model runner performs one bulk store after the async forward materializes. This is a deliberate runner-side integration, trading the async overlap of per-layer saves for a minimal, auditable diff; the roadmap's layered streaming restores the overlap.
+- **Integrity.** Every store carries a `manifest.json` (layer count, block geometry, dtype); loads validate it and fail fast on mismatch — a wrong-shaped or stale store can never be scattered into the paged cache. `max_stored_prefixes` (extra config) optionally prunes oldest stores.
+
 ## Limitations
 
 - **Synchronous file transfer.** Store/load sit on the forward path. Performance is explicitly not the goal of this bring-up; correctness is.
