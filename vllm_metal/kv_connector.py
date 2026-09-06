@@ -168,10 +168,16 @@ class MetalFileConnector(KVConnectorBase_V1):
                     f"KV for request vanished before load: {folder} has no "
                     f"{_DONE_MARKER} marker"
                 )
-            block_index = mx.array(request.block_ids, dtype=mx.uint32)
             for layer_idx in range(registry.num_layers):
                 payload = mx.load(
                     os.path.join(folder, f"layer_{layer_idx:04d}.safetensors")
+                )
+                # The consumer allocates blocks for the whole prompt while
+                # the payload covers only the block-aligned external prefix
+                # — scatter into the leading blocks.
+                num_blocks = payload["key"].shape[0]
+                block_index = mx.array(
+                    request.block_ids[:num_blocks], dtype=mx.uint32
                 )
                 key_cache = registry.key_caches[layer_idx]
                 value_cache = registry.value_caches[layer_idx]
@@ -180,7 +186,7 @@ class MetalFileConnector(KVConnectorBase_V1):
             mx.eval(*registry.key_caches, *registry.value_caches)
             logger.info(
                 "Loaded %d KV blocks x %d layers from %s",
-                len(request.block_ids),
+                num_blocks,
                 registry.num_layers,
                 folder,
             )
@@ -220,6 +226,13 @@ class MetalFileConnector(KVConnectorBase_V1):
         for request in metadata.requests:
             if not request.is_store:
                 continue
+            if not request.block_ids:
+                # Prompt shorter than block_size aligns down to zero
+                # blocks; nothing to transfer for this request.
+                logger.info(
+                    "Skipping KV store for short prompt (0 aligned blocks)"
+                )
+                continue
             folder = self._folder_for(request.token_ids, request.mm_hashes, create=True)
             block_index = mx.array(request.block_ids, dtype=mx.uint32)
             for layer_idx in range(registry.num_layers):
@@ -251,6 +264,7 @@ class MetalFileConnector(KVConnectorBase_V1):
         """Report externally-transferable tokens (directory hit = hit)."""
         if not self._found_match_for_request(request):
             return 0, False
+        logger.info("External KV cache hit for request %s", request.request_id)
         token_ids = request.prompt_token_ids or []
         num_tokens_to_check = _align_to_block_size(len(token_ids) - 1, self._block_size)
         return num_tokens_to_check - num_computed_tokens, False
@@ -276,9 +290,11 @@ class MetalFileConnector(KVConnectorBase_V1):
             token_ids = new_req.prompt_token_ids or []
             mm_hashes = [f.identifier for f in new_req.mm_features]
             if new_req.req_id in self._requests_need_load:
+                # Same aligned-prefix key as the store side (see below).
+                valid = _align_to_block_size(len(token_ids) - 1, self._block_size)
                 meta.requests.append(
                     MetalReqMeta(
-                        token_ids=token_ids,
+                        token_ids=token_ids[:valid],
                         block_ids=list(new_req.block_ids[0]),
                         is_store=False,
                         mm_hashes=mm_hashes,
@@ -287,12 +303,16 @@ class MetalFileConnector(KVConnectorBase_V1):
                 total_need_load += 1
             elif not self._found_match_for_prompt(token_ids, mm_hashes):
                 valid = _align_to_block_size(len(token_ids) - 1, self._block_size)
+                num_blocks = valid // self._block_size
+                if num_blocks == 0:
+                    continue
                 meta.requests.append(
                     MetalReqMeta(
-                        token_ids=token_ids,
-                        block_ids=list(new_req.block_ids[0])[
-                            : valid // self._block_size
-                        ],
+                        # Key must be the block-aligned prefix so the
+                        # consumer's lookup (also aligned) hashes the
+                        # exact same bytes.
+                        token_ids=token_ids[:valid],
+                        block_ids=list(new_req.block_ids[0])[:num_blocks],
                         is_store=True,
                         mm_hashes=mm_hashes,
                     )

@@ -144,6 +144,7 @@ class TestSchedulerRole:
     def test_miss_then_hit_after_store(self, tmp_path) -> None:
         connector = _make_connector(tmp_path, role=KVConnectorRole.SCHEDULER)
         request = SimpleNamespace(
+            request_id="r0",
             prompt_token_ids=list(range(20)),
             mm_features=[],
         )

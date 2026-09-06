@@ -855,7 +855,14 @@ class MetalModelRunner:
                 "models only (dense MHA/GQA); hybrid linear-attention "
                 "state transfer is not implemented."
             )
-        cache = runtime.cache
+        # PagedAttentionRuntimeBase keeps its primary paged cache on
+        # ``_cache`` (no public accessor); same package, direct access.
+        cache = runtime._cache
+        if cache is None:
+            raise RuntimeError(
+                "paged attention runtime has no primary cache; PD "
+                "disaggregation cannot attach."
+            )
         connector = KVConnectorFactory.create_connector(
             self.vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
@@ -2789,12 +2796,12 @@ class MetalModelRunner:
         # PD disaggregation keeps every step on the synchronous sample path —
         # the deferred path skips _sample_paged_batch, which is where store
         # plans are materialized after the forward completes.
-        pipeline_eligible = (
-            self._evaluate_pipeline_gate(scheduler_output)
-            if self._kv_connector_worker is None
-            else False
-        )
-        self._decode_pipeline.begin_step(pipeline_eligible)
+        gate_decision = self._evaluate_pipeline_gate(scheduler_output)
+        if self._kv_connector_worker is not None:
+            gate_decision = PipelineGateDecision(
+                eligible=False, reason="pd disagg: keep steps synchronous"
+            )
+        self._decode_pipeline.begin_step(gate_decision)
 
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
